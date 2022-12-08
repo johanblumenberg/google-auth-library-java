@@ -32,14 +32,7 @@
 package com.google.auth.oauth2;
 
 import static java.util.concurrent.TimeUnit.HOURS;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertNull;
-import static org.junit.Assert.assertSame;
-import static org.junit.Assert.assertThrows;
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
+import static org.junit.Assert.*;
 
 import com.google.api.client.util.Clock;
 import com.google.auth.TestClock;
@@ -877,88 +870,62 @@ public class OAuth2CredentialsTest extends BaseSerializationTest {
   }
 
   @Test
-  public void updateTokenValueBeforeWake() throws IOException, InterruptedException {
-    final SettableFuture<AccessToken> refreshedTokenFuture = SettableFuture.create();
-    AccessToken refreshedToken = new AccessToken("2/MkSJoj1xsli0AccessToken_NKPY2", null);
-    refreshedTokenFuture.set(refreshedToken);
+  public void updateTokenValueBeforeWake() throws Throwable {
+    OAuth2Credentials creds = new OAuth2Credentials() {
+      private int count = 0;
+      @Override
+      public AccessToken refreshAccessToken() {
+        try {
+          Thread.sleep(10);
+        } catch (InterruptedException e) {
+        }
+        return new AccessToken("token-" + count++, null);
+      }
+    };
 
-    final ListenableFutureTask<OAuthValue> task =
-        ListenableFutureTask.create(
-            new Callable<OAuthValue>() {
-              @Override
-              public OAuthValue call() throws Exception {
-                return OAuthValue.create(refreshedToken, new HashMap<>());
-              }
-            });
+    class Refresher extends Thread {
+      volatile Boolean running = true;
+      volatile Throwable ex = null;
 
-    OAuth2Credentials creds =
-        new OAuth2Credentials() {
-          @Override
-          public AccessToken refreshAccessToken() {
-            synchronized (this) {
-              // Wake up the main thread. This is done now because the child thread (t) is known to
-              // have the refresh task. Now we want the main thread to wake up and create a future
-              // in order to wait for the refresh to complete.
-              this.notify();
-            }
-            RefreshTaskListener listener =
-                new RefreshTaskListener(task) {
-                  @Override
-                  public void run() {
-                    try {
-                      // Sleep before setting accessToken to new accessToken. Refresh should not
-                      // complete before this, and the accessToken is `null` until it is.
-                      Thread.sleep(300);
-                      super.run();
-                    } catch (Exception e) {
-                      fail("Unexpected error. Exception: " + e);
-                    }
-                  }
-                };
-
-            this.refreshTask = new RefreshTask(task, listener);
-
-            try {
-              // Sleep for 100 milliseconds to give parent thread time to create a refresh future.
-              Thread.sleep(100);
-              return refreshedTokenFuture.get();
-            } catch (Exception e) {
-              throw new RuntimeException(e);
-            }
+      public void run() {
+        while (running) {
+          try {
+            AccessToken before = creds.getAccessToken();
+            creds.refresh();
+            AccessToken after = creds.getAccessToken();
+            assertNotEquals(before, after);
+          } catch (Throwable e) {
+            ex = e;
+            running = false;
           }
-        };
+        }
+      }
 
-    Thread t =
-        new Thread(
-            new Runnable() {
-              @Override
-              public void run() {
-                try {
-                  creds.refresh();
-                  assertNotNull(creds.getAccessToken());
-                } catch (Exception e) {
-                  fail("Unexpected error. Exception: " + e);
-                }
-              }
-            });
-    t.start();
+      public void end() throws Throwable {
+        running = false;
 
-    synchronized (creds) {
-      // Grab a lock on creds object. This thread (the main thread) will wait here until the child
-      // thread (t) calls `notify` on the creds object.
-      creds.wait();
+        if (ex != null) {
+          throw ex;
+        }
+      }
     }
 
-    AccessToken token = creds.getAccessToken();
-    assertNull(token);
+    Refresher r1 = new Refresher();
+    Refresher r2 = new Refresher();
+    Refresher r3 = new Refresher();
+    r1.start();
+    r2.start();
+    r3.start();
 
-    creds.refresh();
-    token = creds.getAccessToken();
-    // Token should never be NULL after a refresh that succeeded.
-    // Previously the token could be NULL due to an internal race condition between the future
-    // completing and the task listener updating the value of the access token.
-    assertNotNull(token);
-    t.join();
+    // Let the two threads run for a while to try to trigger a race condition
+    Thread.sleep(1000);
+
+    r1.end();
+    r2.end();
+    r3.end();
+    r1.join();
+    r2.join();
+    r3.join();
   }
 
   private void waitForRefreshTaskCompletion(OAuth2Credentials credentials)
